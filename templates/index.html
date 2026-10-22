@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Giám sát báo cháy ESP32</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg:#f4f6f8; --card:#fff; --text:#1c2430; --muted:#6b7785; --line:#e3e8ee;
+    --ok:#1f9d55; --warn:#e08a00; --danger:#d62839; --off:#8895a7;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#10151c; --card:#1a222d; --text:#e8edf3; --muted:#93a1b3; --line:#2a3544; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+         background:var(--bg); color:var(--text); }
+  .wrap { max-width:960px; margin:0 auto; padding:16px; }
+  header { display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; }
+  h1 { font-size:20px; margin:0; }
+  .conn { font-size:13px; color:var(--muted); display:flex; align-items:center; gap:6px; }
+  .dot { width:10px; height:10px; border-radius:50%; background:var(--off); }
+  .dot.on { background:var(--ok); }
+
+  .banner { border-radius:14px; padding:20px; text-align:center; color:#fff;
+            background:var(--off); transition:background .2s; }
+  .banner .big { font-size:30px; font-weight:700; letter-spacing:.5px; }
+  .banner .sub { margin-top:4px; opacity:.9; font-size:14px; }
+  .banner.ok { background:var(--ok); }
+  .banner.warn { background:var(--warn); }
+  .banner.danger { background:var(--danger); animation:pulse 1s infinite; }
+  @keyframes pulse { 50% { filter:brightness(1.25); } }
+
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:12px; margin:12px 0; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; }
+  .card .label { font-size:13px; color:var(--muted); }
+  .card .val { font-size:32px; font-weight:700; margin-top:4px; }
+  .card .val small { font-size:15px; font-weight:500; color:var(--muted); }
+  .card .flag { margin-top:6px; font-size:13px; font-weight:600; color:var(--ok); }
+  .card .flag.on { color:var(--danger); }
+
+  .chart { height:260px; position:relative; }
+  h2 { font-size:15px; margin:0 0 8px; }
+  ul.log { list-style:none; margin:0; padding:0; font-size:14px; max-height:180px; overflow:auto; }
+  ul.log li { padding:6px 0; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; }
+  ul.log li:last-child { border:0; }
+  .muted { color:var(--muted); }
+  .note { font-size:12px; color:var(--muted); margin-top:8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>🔥 Giám sát báo cháy ESP32</h1>
+    <div class="conn"><span class="dot" id="dot"></span><span id="connText">Đang chờ dữ liệu…</span></div>
+  </header>
+
+  <div class="banner" id="banner">
+    <div class="big" id="state">—</div>
+    <div class="sub" id="buzzer">Chưa có dữ liệu</div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <div class="label">Nhiệt độ (DHT11)</div>
+      <div class="val"><span id="temp">--</span> <small>°C</small></div>
+      <div class="flag" id="tflag">Cờ nhiệt: tắt</div>
+    </div>
+    <div class="card">
+      <div class="label">Gas (MQ2, giá trị ADC)</div>
+      <div class="val"><span id="gas">--</span> <small>/ 4095</small></div>
+      <div class="flag" id="gflag">Cờ gas: tắt</div>
+    </div>
+    <div class="card">
+      <div class="label">Nguồn dữ liệu</div>
+      <div class="val" style="font-size:22px" id="source">--</div>
+      <div class="muted" style="font-size:13px;margin-top:6px" id="age">--</div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:12px">
+    <h2>Nhiệt độ theo thời gian</h2>
+    <div class="chart"><canvas id="tchart"></canvas></div>
+  </div>
+  <div class="card" style="margin-bottom:12px">
+    <h2>Gas (ADC) theo thời gian</h2>
+    <div class="chart"><canvas id="gchart"></canvas></div>
+    <div class="note">Gas là giá trị ADC, không phải ppm. Đường đứt nét là ngưỡng bật/tắt cờ trong firmware.</div>
+  </div>
+
+  <div class="card">
+    <h2>Nhật ký đổi trạng thái</h2>
+    <ul class="log" id="log"><li class="muted">Chưa có sự kiện</li></ul>
+  </div>
+</div>
+
+<script>
+const TH = { tOn:{{ temp_on }}, tOff:{{ temp_off }}, gOn:{{ gas_on }}, gOff:{{ gas_off }} };
+
+function mkChart(id, color, onV, offV) {
+  return new Chart(document.getElementById(id), {
+    type: 'line',
+    data: { labels: [], datasets: [
+      { data: [], borderColor: color, borderWidth: 2, pointRadius: 0, tension: .25, spanGaps: false },
+      { data: [], borderColor: '#d62839', borderWidth: 1, borderDash: [6,4], pointRadius: 0 },
+      { data: [], borderColor: '#8895a7', borderWidth: 1, borderDash: [2,4], pointRadius: 0 },
+    ]},
+    options: {
+      animation: false, responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: { x: { ticks: { maxTicksLimit: 6, color: '#8895a7' }, grid: { display: false } },
+                y: { ticks: { color: '#8895a7' } } }
+    }
+  });
+}
+const tChart = mkChart('tchart', '#e08a00');
+const gChart = mkChart('gchart', '#2b7de9');
+
+function fillChart(ch, labels, data, onV, offV) {
+  ch.data.labels = labels;
+  ch.data.datasets[0].data = data;
+  ch.data.datasets[1].data = labels.map(() => onV);
+  ch.data.datasets[2].data = labels.map(() => offV);
+  ch.update();
+}
+
+const fmt = ts => new Date(ts * 1000).toLocaleTimeString('vi-VN');
+
+function setBanner(s) {
+  const b = document.getElementById('banner');
+  b.className = 'banner';
+  let text = s.state, cls = 'ok';
+  if (s.state === 'BAO CHAY!') { text = '🚨 BÁO CHÁY!'; cls = 'danger'; }
+  else if (s.state === 'CANH BAO: NHIET') { text = '⚠️ CẢNH BÁO: NHIỆT ĐỘ CAO'; cls = 'warn'; }
+  else if (s.state === 'CANH BAO: GAS') { text = '⚠️ CẢNH BÁO: PHÁT HIỆN GAS/KHÓI'; cls = 'warn'; }
+  else if (s.state === 'BINH THUONG') { text = '✅ BÌNH THƯỜNG'; }
+  b.classList.add(cls);
+  document.getElementById('state').textContent = text;
+  document.getElementById('buzzer').textContent = s.buzzer ? '🔔 Còi đang kêu' : '🔕 Còi tắt';
+}
+
+function setFlag(id, on, name) {
+  const el = document.getElementById(id);
+  el.textContent = `Cờ ${name}: ${on ? 'BẬT' : 'tắt'}`;
+  el.classList.toggle('on', on);
+}
+
+async function refresh() {
+  try {
+    const r = await fetch('/api/history');
+    const d = await r.json();
+    const h = d.history;
+    const dot = document.getElementById('dot');
+    const ct = document.getElementById('connText');
+
+    if (!h.length) { dot.classList.remove('on'); ct.textContent = 'Chưa nhận được dữ liệu từ ESP32'; return; }
+
+    const s = h[h.length - 1];
+    const age = d.server_time - s.ts;
+    const live = age < 5;
+    dot.classList.toggle('on', live);
+    ct.textContent = live ? 'Đang nhận dữ liệu' : 'Mất kết nối ESP32';
+
+    setBanner(s);
+    document.getElementById('temp').textContent = s.temp === null ? '--' : s.temp.toFixed(1);
+    document.getElementById('gas').textContent = s.gas;
+    setFlag('tflag', s.temp_alarm, 'nhiệt');
+    setFlag('gflag', s.gas_alarm, 'gas');
+    document.getElementById('source').textContent = {serial:'USB / Serial', wifi:'WiFi', demo:'Dữ liệu giả'}[s.source] || s.source;
+    document.getElementById('age').textContent = `Cập nhật ${fmt(s.ts)} (${age.toFixed(0)} giây trước)`;
+
+    const labels = h.map(x => fmt(x.ts));
+    fillChart(tChart, labels, h.map(x => x.temp), TH.tOn, TH.tOff);
+    fillChart(gChart, labels, h.map(x => x.gas), TH.gOn, TH.gOff);
+
+    const log = document.getElementById('log');
+    log.innerHTML = d.events.length
+      ? d.events.map(e => `<li><span>${e.state}</span><span class="muted">${fmt(e.ts)}</span></li>`).join('')
+      : '<li class="muted">Chưa có sự kiện</li>';
+  } catch (e) {
+    document.getElementById('connText').textContent = 'Không kết nối được server';
+    document.getElementById('dot').classList.remove('on');
+  }
+}
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>
